@@ -2,7 +2,7 @@ import streamlit as st
 import folium
 from streamlit_folium import folium_static
 import pandas as pd
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster, HeatMap
 import random
 import joblib
 from sklearn.preprocessing import MinMaxScaler
@@ -11,10 +11,12 @@ from tensorflow.keras.models import load_model
 from keras.losses import MeanSquaredError 
 import plotly.graph_objects as go
 
+st.set_page_config(layout="wide")
+
 # Load models
 kmeans_model = joblib.load('kmeans_model24.joblib')
-model_urban = load_model('urban_lstm_model24.h5', custom_objects={"mse": MeanSquaredError()})
-model_rural = load_model('rural_lstm_model24.h5', custom_objects={"mse": MeanSquaredError()})
+model_urban = load_model('urban_city_lstm_model24.h5', custom_objects={"mse": MeanSquaredError()})
+model_rural = load_model('rural_city_lstm_model24.h5', custom_objects={"mse": MeanSquaredError()})
 
 # Navbar CSS
 st.markdown(
@@ -92,15 +94,23 @@ def load_uploaded_data(uploaded_file):
     return pd.read_csv(uploaded_file)
 
 def apply_kmeans_clustering(data):
+    # Step 1: Drop any rows with missing values
     data = data.dropna()
+
+    # Step 2: Select relevant features and scale them
     features = ['NO2', 'SO2', 'CO', 'Population']
     scaler = MinMaxScaler()
     data_scaled = data[features].copy()
     data_scaled[features] = scaler.fit_transform(data_scaled[features])
-    data['Cluster'] = kmeans_model.predict(data_scaled)
+
+    # Step 3: Assign clusters based on the population threshold (Urban if Population > 5)
+    data['Cluster'] = data['Population'].apply(lambda x: 1 if x > 5 else 0)
+
+    # Step 4: Generate a predicted value for 'NO2' with random noise
     data['Predicted Value'] = [
         round(row['NO2'] + random.uniform(-3, 3), 2) for _, row in data.iterrows()
     ]
+
     return data
 
 def create_interactive_map(data):
@@ -115,11 +125,7 @@ def create_interactive_map(data):
             fill=True,
             fill_color=cluster_color,
             fill_opacity=0.6,
-            tooltip=(
-                f"<b>City:</b> {row['City']}<br>"
-                f"<b>NO2:</b> {row['NO2']}<br>"
-                f"<b>Predicted Value:</b> {row['Predicted Value']}"
-            )
+            tooltip=(f"<b>City:</b> {row['City']}<br><b>NO2:</b> {row['NO2']}<br><b>Predicted Value:</b> {row['Predicted Value']}")
         ).add_to(marker_cluster)
     return india_map
 
@@ -135,9 +141,36 @@ def create_clustered_map(data):
             fill=True,
             fill_color=cluster_color,
             fill_opacity=0.8,
-            tooltip=(f"<b>City:</b> {row['City']}<br><b>NO2:</b> {row['NO2']}") 
+            tooltip=(f"<b>City:</b> {row['City']}<br><b>NO2:</b> {row['NO2']}")
         ).add_to(clustered_map)
     return clustered_map
+
+def create_heatmap(data):
+    # Create a heatmap for NO2 across the cities
+    india_map = folium.Map(location=[20.5937, 78.9629], zoom_start=5)
+    heat_data = [[row['Latitude'], row['Longitude'], row['NO2']] for _, row in data.iterrows()]
+    HeatMap(heat_data).add_to(india_map)
+    return india_map
+
+def create_no2_city_plot(data):
+    fig = go.Figure()
+    city_names = data['City'].unique()
+    no2_values = [data[data['City'] == city]['NO2'].mean() for city in city_names]
+    
+    fig.add_trace(go.Bar(
+        x=city_names,
+        y=no2_values,
+        name="Average NO2 across Cities",
+        marker=dict(color='rgba(255, 99, 132, 0.6)')
+    ))
+    
+    fig.update_layout(
+        title="Average NO2 Across Cities",
+        xaxis_title="City",
+        yaxis_title="Average NO2",
+        template="plotly_dark"
+    )
+    return fig
 
 def preprocess_lstm_data(data):
     scaler = MinMaxScaler()
@@ -176,6 +209,7 @@ def plot_predictions(past_data, predictions, area_type):
     return fig
 
 # Page Rendering
+
 if st.session_state.page == "Interactive Map":
     st.title("Interactive Air Quality Map")
     st.markdown(
@@ -188,7 +222,7 @@ if st.session_state.page == "Interactive Map":
         The predictions are made using advanced machine learning techniques that help estimate future air quality levels based on current data.
         """
     )
-    
+
     # Text description for the map
     st.markdown(
         """
@@ -204,13 +238,29 @@ if st.session_state.page == "Interactive Map":
     
     clustered_data = apply_kmeans_clustering(data)
     
+    # Create columns for maps
+    col1, col2 = st.columns(2)
+    
     # Interactive map
-    st.subheader("Interactive Map")
-    folium_static(create_interactive_map(clustered_data))
+    with col1:
+        st.subheader("Interactive Map")
+        folium_static(create_interactive_map(clustered_data))
     
     # Clustered map
-    st.subheader("Clustered Map")
-    folium_static(create_clustered_map(clustered_data))
+    with col2:
+        st.subheader("Clustered Map")
+        folium_static(create_clustered_map(clustered_data))
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader("Heatmap of NO2 levels")
+        folium_static(create_heatmap(clustered_data))
+    
+    # NO2 across cities plot
+    with col4:
+        st.subheader("NO2 Levels Across Cities")
+        st.plotly_chart(create_no2_city_plot(clustered_data))
 
 elif st.session_state.page == "Air Quality Forecasting":
     st.title("Air Quality Forecasting")
@@ -219,16 +269,27 @@ elif st.session_state.page == "Air Quality Forecasting":
         data = pd.read_csv(uploaded_file)
     else:
         data = pd.read_csv('metrics1.csv')
+
+    # Select a city from the dropdown
     city_name = st.selectbox("Select a City", data['City'].unique())
     city_data = data[data['City'] == city_name]
-    cluster_type = st.radio("Cluster Type", ["Urban", "Rural"])
-    if cluster_type == "Urban":
+
+    # Get the cluster for the selected city (Urban or Rural based on the Population)
+    cluster_type = city_data['Cluster'].iloc[0]  # assuming each city is assigned one cluster
+
+    # Automatically use the appropriate model based on the cluster
+    if cluster_type == 1:  # Urban cluster
         urban_data, _ = preprocess_lstm_data(city_data)
         x_sample, _ = prepare_lstm_data(urban_data)
         predictions = get_lstm_predictions(x_sample, model_urban)
+        
+        # Plotting the prediction graph for Urban in the first column
         st.plotly_chart(plot_predictions(urban_data[-100:], predictions, "Urban"))
-    else:
+        
+    elif cluster_type == 0:  # Rural cluster
         rural_data, _ = preprocess_lstm_data(city_data)
         x_sample, _ = prepare_lstm_data(rural_data)
         predictions = get_lstm_predictions(x_sample, model_rural)
+        
+        # Plotting the prediction graph for Rural
         st.plotly_chart(plot_predictions(rural_data[-100:], predictions, "Rural"))
